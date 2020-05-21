@@ -26,6 +26,7 @@ import org.flywaydb.core.internal.util.SqlCallable;
 import java.math.BigInteger;
 import java.sql.SQLException;
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
 
 /**
  * CockroachDB-specific table.
@@ -36,6 +37,16 @@ import java.util.Random;
  */
 public class CockroachDBTable extends Table<CockroachDBDatabase, CockroachDBSchema> {
     private static final Log LOG = LogFactory.getLog(CockroachDBTable.class);
+
+    /**
+     * The maximum number of nanoseconds to wait while attempting to acquire the insert lock.
+     */
+    private static final int LOCK_ID = -100;
+
+    /**
+     * The maximum number of nanoseconds to wait while attempting to acquire the insert lock.
+     */
+    private static final long MAX_LOCK_ACQUIRE_NANOS = 1_000_000_000L * 60 * 10;
 
     /**
      * A random string, used as an ID of this instance of Flyway.
@@ -105,26 +116,45 @@ public class CockroachDBTable extends Table<CockroachDBDatabase, CockroachDBSche
             return;
         }
 
-        int retryCount = 0;
+        long endTime = System.nanoTime() + MAX_LOCK_ACQUIRE_NANOS;
+        String firstSeenLockHolder = null;
         do {
             try {
                 if (insertLockingRow()) {
                     return;
                 }
-                retryCount++;
                 LOG.debug("Waiting for lock on " + this);
-                Thread.sleep(1000);
+
+                // check which peer currently is holding the insert lock to see if we can optimize the sleep time
+                String currentLockHolder = jdbcTemplate.queryForString("SELECT version FROM " + this + " WHERE installed_rank = " + LOCK_ID + " AND DESCRIPTION = 'flyway-lock'");
+
+                if (currentLockHolder == null) {
+                    // if there was no lock holder, it's opened up since we tried to insert, so don't bother to sleep
+                    // (we might get lucky if we retry immediately).
+                    continue;
+                } else if (firstSeenLockHolder == null) {
+                    firstSeenLockHolder = currentLockHolder;
+                } else if (firstSeenLockHolder.equals(currentLockHolder)) {
+                    // if the lock holder is the same as the first one we saw, assume that lock holder is doing valid migration work.
+                    Thread.sleep(1000);
+                } else {
+                    // if the lock holder has changed, assume it's another instance of the same application that will attempt
+                    // to execute the same migrations as the first lock holder we saw. that secondary peer should finish quickly
+                    // (as the migration work is already done, and optimistically assume that it succeeded),
+                    // and thus sleep for a shorter period.
+                    Thread.sleep(250);
+                }
             } catch (InterruptedException ex) {
                 // Ignore - if interrupted, we still need to wait for lock to become available
             }
-        } while (retryCount < 50);
+        } while (System.nanoTime() < endTime);
 
         throw new FlywayException("Unable to obtain table lock - another Flyway instance may be running");
     }
 
     private boolean insertLockingRow() {
         // Insert the locking row - the primary keyness of installed_rank will prevent us having two.
-        Results results = jdbcTemplate.executeStatement("INSERT INTO " + this + " VALUES (-100, '" + tableLockString + "', 'flyway-lock', '', '', 0, '', now(), 0, TRUE)");
+        Results results = jdbcTemplate.executeStatement("INSERT INTO " + this + " VALUES (" + LOCK_ID + ", '" + tableLockString + "', 'flyway-lock', '', '', 0, '', now(), 0, TRUE)");
         // Succeeded if one row updated and no errors.
         return (results.getResults().size() > 0
                 && results.getResults().get(0).getUpdateCount() == 1

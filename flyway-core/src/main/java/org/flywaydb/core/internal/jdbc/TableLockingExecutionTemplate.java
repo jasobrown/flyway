@@ -15,6 +15,7 @@
  */
 package org.flywaydb.core.internal.jdbc;
 
+import org.flywaydb.core.api.FlywayException;
 import org.flywaydb.core.internal.database.base.Table;
 
 import java.util.concurrent.Callable;
@@ -33,8 +34,10 @@ public class TableLockingExecutionTemplate implements ExecutionTemplate {
         return executionTemplate.execute(new Callable<T>() {
             @Override
             public T call() throws Exception {
+                // try to acquire the lock; if we fail, don't attempt to release the lock.
+                table.lock();
+
                 try {
-                    table.lock();
                     return callback.call();
                 } finally {
                     table.unlock();
